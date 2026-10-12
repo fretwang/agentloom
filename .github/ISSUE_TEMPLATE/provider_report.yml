@@ -1,0 +1,46 @@
+name: Provider compatibility report
+description: Tell us how agentloom behaves with a specific model service
+labels: [provider]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        No test in this repository calls a live model API, so reports from real
+        services are how the compatibility notes in the guide get verified.
+        Running examples/04_openai_compatible.py is enough.
+  - type: input
+    id: service
+    attributes:
+      label: Service and base URL
+      description: For example "DeepSeek, https://api.deepseek.com". Never include your API key.
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model ID
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works with default options
+        - Works after changing options
+        - Does not work
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: >
+        Options you had to change (max_tokens_param, include_usage, replay_reasoning, extra),
+        whether tool calls, parallel tool calls and token usage worked, and any error text.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: agentloom commit and SDK version

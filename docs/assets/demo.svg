@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 682 404" width="682" height="404" role="img" aria-label="Output of python examples/03_offline_demo.py">
+<rect width="682" height="404" rx="10" fill="#1a1b26"/>
+<circle cx="22" cy="17" r="6" fill="#f7768e"/>
+<circle cx="42" cy="17" r="6" fill="#e0af68"/>
+<circle cx="62" cy="17" r="6" fill="#9ece6a"/>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" xml:space="preserve">
+<text x="18" y="52" fill="#e0af68">$ python examples/03_offline_demo.py</text>
+<text x="18" y="72" fill="#787c99">&gt; run 4d94d17f (agent)</text>
+<text x="18" y="92" fill="#787c99">  step 1: tool_use [in 10 / out 5 / cached 0]</text>
+<text x="18" y="112" fill="#7dcfff">  -&gt; stock_level({&quot;item&quot;: &quot;widget&quot;})</text>
+<text x="18" y="132" fill="#7dcfff">  -&gt; stock_level({&quot;item&quot;: 42})</text>
+<text x="18" y="152" fill="#9ece6a">  ok stock_level 0.00s: 12</text>
+<text x="18" y="172" fill="#f7768e">  !! stock_level 0.00s: Invalid arguments: - $.item: expected string, got int</text>
+<text x="18" y="192" fill="#787c99">  step 2: tool_use [in 10 / out 5 / cached 0]</text>
+<text x="18" y="212" fill="#7dcfff">  -&gt; stock_level({&quot;item&quot;: &quot;gizmo&quot;})</text>
+<text x="18" y="232" fill="#7dcfff">  -&gt; pricing_specialist({&quot;task&quot;: &quot;Price of a widget?&quot;})</text>
+<text x="18" y="252" fill="#f7768e">  !! stock_level 0.00s: Unknown item &#x27;gizmo&#x27;. Known items: widget, gadget.</text>
+<text x="18" y="272" fill="#9ece6a">  ok pricing_specialist 0.00s: A widget costs $4.50.</text>
+<text x="18" y="292" fill="#787c99">  step 3: end_turn [in 10 / out 5 / cached 0]</text>
+<text x="18" y="312" fill="#787c99">= completed after 3 step(s), 75 tokens</text>
+<text x="18" y="332" fill="#c0caf5"></text>
+<text x="18" y="352" fill="#c0caf5">We have 12 widgets at $4.50 each. I could not find an item called &#x27;gizmo&#x27;.</text>
+<text x="18" y="372" fill="#c0caf5">[completed: 3 steps, 75 tokens]</text>
+</g>
+</svg>

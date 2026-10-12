@@ -24,6 +24,7 @@ from .events import (
     ToolCallStarted,
 )
 from .hooks import Hooks
+from .output import FINAL_ANSWER
 from .policies import RetryPolicy, RunLimits
 from .providers.base import Completed, Provider, ProviderChunk, TextChunk, ThinkingChunk
 from .session import FileSession, InMemorySession, Session
@@ -44,6 +45,7 @@ from .types import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "FINAL_ANSWER",
     "Agent",
     "AgentLoomError",
     "Approval",

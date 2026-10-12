@@ -42,6 +42,7 @@ from .events import (
     ToolCallStarted,
 )
 from .hooks import Hooks
+from .output import ANSWER_NOT_ALONE, ANSWER_REMINDER, FINAL_ANSWER, OutputSpec
 from .policies import RetryPolicy, RunLimits
 from .providers.base import Provider, TextChunk, ThinkingChunk
 from .session import Session, repair_history
@@ -72,6 +73,7 @@ class RunResult:
     new_messages: list[Message]  # what this run added
     usage: Usage
     steps: int
+    data: Any = None  # the validated answer when the agent has an ``output_type``
 
     @property
     def ok(self) -> bool:
@@ -123,6 +125,9 @@ class Agent:
             Without one, such calls are refused.
         max_tokens: Output-token cap per model call; ``None`` uses the
             provider's default.
+        output_type: Ask for a structured answer: a dataclass, pydantic model,
+            any type a tool parameter may have, or a JSON Schema mapping. The
+            validated answer is ``RunResult.data``.
     """
 
     def __init__(
@@ -138,6 +143,7 @@ class Agent:
         hooks: Sequence[Hooks] = (),
         approval: ApprovalHandler | None = None,
         max_tokens: int | None = None,
+        output_type: Any = None,
     ) -> None:
         self.provider = provider
         self.name = name
@@ -149,6 +155,11 @@ class Agent:
         self.hooks = list(hooks)
         self.approval = approval
         self.max_tokens = max_tokens
+        self._output = OutputSpec.of(output_type) if output_type is not None else None
+        if self._output is not None and self.tools.get(FINAL_ANSWER) is not None:
+            raise ConfigurationError(
+                f"a tool named {FINAL_ANSWER!r} cannot be combined with output_type"
+            )
         self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     # --- public API --------------------------------------------------------
@@ -259,10 +270,13 @@ class Agent:
 
         run = _RunState(run_id=uuid.uuid4().hex, deps=deps)
         system = self.instructions(deps) if callable(self.instructions) else self.instructions
-        specs = self.tools.specs()
+        output = self._output
+        specs = self.tools.specs() + ([output.spec] if output is not None else [])
         started = time.monotonic()
         step = 0
         status: RunStatus
+        data: Any = None
+        answer: str | None = None
 
         async def persist() -> None:
             if session is not None:
@@ -326,9 +340,16 @@ class Agent:
 
             calls = response.message.tool_calls
             if not calls:
-                truncated = stop is StopReason.MAX_TOKENS
-                status = RunStatus.TRUNCATED if truncated else RunStatus.COMPLETED
-                break
+                if stop is StopReason.MAX_TOKENS:
+                    status = RunStatus.TRUNCATED
+                    break
+                if output is None:
+                    status = RunStatus.COMPLETED
+                    break
+                # A structured answer has to arrive through the answer tool.
+                history.append(Message.user(ANSWER_REMINDER))
+                await persist()
+                continue
 
             if stop is StopReason.MAX_TOKENS:
                 # Arguments may be cut off mid-value; running them could act on partial data.
@@ -342,25 +363,51 @@ class Agent:
                     for call in calls
                 ]
             else:
-                results = []
-                async for outcome in self._execute_tools(run, step, calls):
-                    if isinstance(outcome, list):
-                        results = outcome
+                answers = [c for c in calls if output is not None and c.name == FINAL_ANSWER]
+                others = [c for c in calls if c not in answers]
+                by_id: dict[str, ToolResult] = {}
+                if others:
+                    async for outcome in self._execute_tools(run, step, others):
+                        if isinstance(outcome, list):
+                            by_id.update((r.tool_call_id, r) for r in outcome)
+                        else:
+                            yield outcome
+                for call in answers:
+                    assert output is not None
+                    yield ToolCallStarted(run.run_id, step, call)
+                    if others or len(answers) > 1:
+                        # The answer may depend on results the model has not seen yet.
+                        verdict = ToolResult(call.id, ANSWER_NOT_ALONE, is_error=True)
                     else:
-                        yield outcome
+                        data, text, problems = output.parse(call.arguments)
+                        if problems:
+                            listing = "\n".join(f"- {p}" for p in problems)
+                            verdict = ToolResult(
+                                call.id, f"Invalid answer:\n{listing}", is_error=True
+                            )
+                        else:
+                            answer = text
+                            verdict = ToolResult(call.id, "Answer accepted.")
+                    by_id[call.id] = verdict
+                    yield ToolCallFinished(run.run_id, step, call, verdict, 0.0)
+                results = [by_id[c.id] for c in calls]
             history.append(Message("user", list(results)))
             await persist()
+            if answer is not None:
+                status = RunStatus.COMPLETED
+                break
 
         new_messages = history[base:]
         last_reply = next((m for m in reversed(new_messages) if m.role == "assistant"), None)
         result = RunResult(
             run_id=run.run_id,
             status=status,
-            output=last_reply.text if last_reply else "",
+            output=answer if answer is not None else (last_reply.text if last_reply else ""),
             messages=list(history),
             new_messages=new_messages,
             usage=run.usage,
             steps=step,
+            data=data,
         )
         yield RunFinished(run.run_id, result)
 

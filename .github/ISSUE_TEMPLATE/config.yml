@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/fretwang/agentloom/blob/main/docs/en/guide.md
+    about: The user guide covers every feature, with a troubleshooting table at the end.

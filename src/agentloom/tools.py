@@ -343,7 +343,18 @@ def _converter_for(annotation: Any) -> Callable[[Any], Any] | None:
         return typing.cast("Callable[[Any], Any]", annotation.model_validate)
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
         cls = annotation
-        return lambda value: cls(**value)
+        hints = typing.get_type_hints(cls, include_extras=True)
+        nested = {f.name: _converter_for(hints.get(f.name, Any)) for f in dataclasses.fields(cls)}
+
+        def build(value: Any) -> Any:
+            return cls(**{k: c(v) if (c := nested.get(k)) else v for k, v in value.items()})
+
+        return build
+    if (origin or annotation) in (list, Sequence, typing.Sequence):
+        args = typing.get_args(annotation)
+        item = _converter_for(args[0]) if args else None
+        if item is not None:
+            return lambda value: [item(v) for v in value]
     return None
 
 

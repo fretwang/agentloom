@@ -2,7 +2,7 @@
 
 [简体中文](../zh/guide.md)
 
-Contents: [First agent](#1-first-agent) · [Tools](#2-tools) · [Running](#3-running-an-agent) · [Sessions](#4-sessions) · [Limits and retries](#5-limits-and-retries) · [Approval](#6-human-approval) · [Hooks](#7-hooks) · [Context](#8-context-strategies) · [Multi-agent](#9-multi-agent) · [Tracing](#10-tracing) · [Testing](#11-testing-your-agents) · [Claude provider](#12-the-claude-provider) · [Troubleshooting](#13-troubleshooting)
+Contents: [First agent](#1-first-agent) · [Tools](#2-tools) · [Running](#3-running-an-agent) · [Sessions](#4-sessions) · [Limits and retries](#5-limits-and-retries) · [Approval](#6-human-approval) · [Hooks](#7-hooks) · [Context](#8-context-strategies) · [Multi-agent](#9-multi-agent) · [Tracing](#10-tracing) · [Testing](#11-testing-your-agents) · [Claude provider](#12-the-claude-provider) · [OpenAI-compatible provider](#13-the-openai-compatible-provider) · [Structured output](#14-structured-output) · [MCP servers](#15-mcp-servers) · [Troubleshooting](#16-troubleshooting)
 
 ---
 
@@ -544,15 +544,144 @@ provider = AnthropicProvider(
 
 **Inspecting requests.** `provider.build_params(request)` returns the exact keyword arguments that would be sent, which is useful in tests and when debugging.
 
-For models from other vendors, see [Writing a provider](architecture.md#writing-a-provider).
+For OpenAI-compatible services, see the next section. For anything else, see [Writing a provider](architecture.md#writing-a-provider).
 
 ---
 
-## 13. Troubleshooting
+## 13. The OpenAI-compatible provider
+
+`OpenAIProvider` speaks the Chat Completions protocol through the official OpenAI SDK, so it works with OpenAI and with every service or local server that implements the same API. Install it with `pip install "agentloom[openai]"`.
+
+```python
+from agentloom.providers.openai import OpenAIProvider
+
+provider = OpenAIProvider(
+    "deepseek-chat",                      # model ID, as the endpoint names it (required)
+    base_url="https://api.deepseek.com",  # None = OPENAI_BASE_URL, else OpenAI
+    api_key=None,                         # None = OPENAI_API_KEY
+    max_tokens=None,                      # output cap per call; None = endpoint default
+    max_tokens_param="max_tokens",        # or "max_completion_tokens"
+    include_usage=True,                   # ask for token usage in the stream
+    replay_reasoning=False,               # see below
+    extra=None,                           # temperature, reasoning_effort, extra_body, ...
+)
+```
+
+Some common endpoints. Model IDs change often, so take them from the service's own documentation:
+
+| Service | `base_url` | Example model |
+|---|---|---|
+| OpenAI | (default) | `gpt-5` |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` |
+| Qwen (Alibaba DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| Moonshot (Kimi) | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| OpenRouter | `https://openrouter.ai/api/v1` | see their model list |
+| Ollama (local) | `http://localhost:11434/v1` | `llama3.3` |
+| vLLM (local) | `http://localhost:8000/v1` | whatever you served |
+
+Local servers that need no key still need a placeholder, for example `api_key="ollama"`. For Azure OpenAI or custom HTTP settings, build the SDK client yourself and pass `client=AsyncAzureOpenAI(..., max_retries=0)`.
+
+What it does for you:
+
+- **Always streams**, and assembles tool calls from their fragments, including several calls in one turn.
+- **Parses tool arguments** from the JSON string the protocol uses. Arguments cut off by the output limit are reported as `MAX_TOKENS` and not run; arguments that are garbled for any other reason make the turn retryable.
+- **Marks tool errors in the text** (`Error: ...`), because the protocol has no error flag on tool results.
+- **Reports cached prompt tokens separately** when the service sends `prompt_tokens_details.cached_tokens`, so `result.usage.cache_read_tokens` means the same as with Claude.
+- **Surfaces reasoning** as `ThinkingDelta` events when the service streams a `reasoning_content` or `reasoning` field.
+
+Things that differ between services:
+
+- **The model must support tool calling.** With a model that does not, the service returns an error or the model answers in plain text without calling anything.
+- **`max_tokens_param`.** Most compatible servers expect `max_tokens`. OpenAI's reasoning models reject it and require `max_tokens_param="max_completion_tokens"`.
+- **`include_usage`.** Turn it off if the server rejects `stream_options`. Token budgets (`max_total_tokens`) cannot work when the server reports no usage.
+- **`replay_reasoning`.** Reasoning text is kept in `provider_data` and by default is not sent back. Set `replay_reasoning=True` only if your endpoint requires earlier `reasoning_content` on later turns.
+- **A stream that ends without a finish reason** is treated as a retryable failure, since a cut-off answer cannot be told from a complete one.
+
+Sessions written with one provider can be continued with another: each provider replays its own messages natively and reads everyone else's through the neutral view.
+
+---
+
+## 14. Structured output
+
+Pass `output_type` to get a validated object instead of text:
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class Triage:
+    category: Literal["billing", "bug", "other"]
+    urgent: bool
+    summary: str
+
+agent = Agent(provider, instructions="Triage support tickets.", output_type=Triage)
+result = await agent.run("I was charged twice and need this fixed today!")
+
+result.data     # Triage(category="billing", urgent=True, summary="...")
+result.output   # the same answer as JSON text
+```
+
+`output_type` accepts a dataclass, a pydantic model, any type a tool parameter may have (`list[str]`, `int`, an `Enum`, ...), or a JSON Schema mapping. Dataclasses, pydantic models and enums are converted, including dataclasses nested in dataclasses and lists; with a JSON Schema you get plain dicts and lists.
+
+How it works: the agent offers the model one extra tool, `final_answer`, whose input schema is your type. The answer is that tool's arguments, so this works with every provider that supports tool calling, and the answer is checked by the same validation as tool arguments.
+
+- **An invalid answer is sent back** to the model as an error listing what is wrong, and it tries again. `max_steps` bounds the attempts.
+- **A plain-text reply does not end the run.** The agent adds one user message, ``Give your final answer by calling the `final_answer` tool.``, and continues. This message and the tool description are the only text the framework adds; both are in `agentloom/output.py`.
+- **An answer given together with other tool calls is deferred.** The other tools run, the answer is refused, and the model answers again once it has seen their results.
+- **An answer cut off by the output limit is never accepted**, as with any truncated tool call.
+- When the run does not complete (`result.ok` is false), `result.data` is `None`.
+
+You cannot also have a tool of your own named `final_answer`.
+
+---
+
+## 15. MCP servers
+
+`MCPTools` connects to a [Model Context Protocol](https://modelcontextprotocol.io) server and turns its tools into agentloom tools. Install it with `pip install "agentloom[mcp]"` (version 2 or newer of the official MCP SDK).
+
+```python
+from agentloom.mcp import MCPTools
+
+async with MCPTools.stdio("npx", "-y", "@modelcontextprotocol/server-filesystem", ".") as files:
+    agent = Agent(provider, tools=files)
+    result = await agent.run("Which Python files here are longer than 300 lines?")
+```
+
+The connection lives for the `async with` block; run the agent inside it. `MCPTools.stdio(command, *args, env=None, cwd=None)` starts a local server as a subprocess. For a remote server pass its Streamable HTTP URL: `MCPTools("https://example.com/mcp")`. Anything else `mcp.Client` accepts works too, such as a transport you configured with authentication.
+
+Combine servers and your own tools freely:
+
+```python
+async with MCPTools.stdio("my-git-server", prefix="git") as git, MCPTools(url, prefix="crm") as crm:
+    agent = Agent(provider, tools=[*git, *crm, my_own_tool])
+```
+
+| Option | Effect |
+|---|---|
+| `prefix="git"` | Tools are named `git_<name>`. Use it when two servers have tools with the same name |
+| `include=[...]` | Expose only these server tools. Fewer tools means a smaller prompt and fewer wrong choices |
+| `requires_approval=True` or `[...]` | Route all calls, or the named server tools, through your approval handler |
+| `timeout=30` | Seconds allowed per call; the default is `RunLimits.tool_timeout` |
+
+MCP tools are ordinary tools, so everything in this guide applies to them: arguments are validated against the server's schema before the call is sent, failures become error results the model can read, and limits, hooks and tracing work unchanged. Tool names are made safe for model APIs (`files.delete` becomes `files_delete`).
+
+**Treat a server as code you did not write.** Its tool descriptions go into the model's prompt and its results into the conversation. Use servers you trust, expose only the tools you need with `include`, and set `requires_approval` on the ones that change things.
+
+Not supported: MCP resources, prompts, sampling and elicitation. Images and other non-text content in a tool result are replaced by a placeholder such as `[image omitted: image/png]`.
+
+---
+
+## 16. Troubleshooting
 
 | Symptom | Likely cause and fix |
 |---|---|
 | `ConfigurationError: AnthropicProvider needs the Anthropic SDK` | `pip install "agentloom[anthropic]"` |
+| `ConfigurationError: OpenAIProvider needs the OpenAI SDK` | `pip install "agentloom[openai]"` |
+| `ConfigurationError: MCPTools needs the MCP SDK` (or "version 2 or newer") | `pip install "agentloom[mcp]"`, which requires `mcp>=2.0` |
+| A run with `output_type` ends with `MAX_STEPS` and `data` is `None` | The model kept answering in text or kept sending invalid answers. Read the trace; a simpler schema or field descriptions usually fix it |
+| An MCP tool result says the connection to the MCP server is closed | The agent ran after the `async with MCPTools(...)` block ended. Run it inside the block |
+| `ProviderError: 400` from an OpenAI-compatible service mentioning `stream_options`, `max_tokens` or `tools` | The service does not accept that field: set `include_usage=False`, change `max_tokens_param`, or pick a model that supports tool calling |
 | `FileNotFoundError` from `ssl.create_default_context` when creating the provider | The `SSL_CERT_FILE` environment variable points to a file that does not exist. Unset it or point it at a real CA bundle |
 | `ProviderError: 401` | Missing or wrong API key |
 | `ProviderError: 400` mentioning `fallbacks` or an unknown beta | Your endpoint does not accept the fallback beta: `AnthropicProvider(refusal_fallback=False)` |

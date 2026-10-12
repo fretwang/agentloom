@@ -2,24 +2,24 @@
 
 [简体中文](../zh/architecture.md)
 
-Contents: [Design principles](#design-principles) · [Module map](#module-map) · [Life of a run](#life-of-a-run) · [Guarantees](#guarantees) · [Writing a provider](#writing-a-provider) · [Writing a session store](#writing-a-session-store) · [Writing a context strategy](#writing-a-context-strategy) · [What is not here](#what-is-not-here)
+Contents: [Design principles](#design-principles) · [Module map](#module-map) · [Life of a run](#life-of-a-run) · [Guarantees](#guarantees) · [Writing a provider](#writing-a-provider) · [Writing a session store](#writing-a-session-store) · [Writing a context strategy](#writing-a-context-strategy) · [Verification status](#verification-status) · [What is not here](#what-is-not-here)
 
 ---
 
 ## Design principles
 
-**1. One loop, visible.** The agent loop is a single function, `Agent._iterate`, of about 120 lines. There is no graph engine, no planner abstraction, and no hidden prompt: the only text the model receives is your instructions, your tool descriptions, and the conversation.
+**1. One loop, visible.** The agent loop is a single function, `Agent._iterate`, of about 160 lines. There is no graph engine, no planner abstraction, and no hidden prompt: the only text the model receives is your instructions, your tool descriptions, and the conversation. The one exception is opt-in: with `output_type`, the agent adds the `final_answer` tool and, if the model answers in plain text, a one-line reminder to use it.
 
 **2. Four seams, each a small interface.** Everything that varies between deployments sits behind one of four interfaces, each with one or two methods:
 
 | Seam | Interface | Methods | Shipped implementations |
 |---|---|---|---|
-| Model API | `Provider` | `stream` | `AnthropicProvider`, `ScriptedProvider` |
+| Model API | `Provider` | `stream` | `AnthropicProvider`, `OpenAIProvider`, `ScriptedProvider` |
 | Persistence | `Session` | `load`, `save` | `InMemorySession`, `FileSession` |
 | Context selection | `ContextStrategy` | `prepare` | `KeepAll`, `SlidingWindow`, `Summarizing` |
 | Policy and observation | `Hooks` | `on_event`, `before_model`, `before_tool`, `after_tool` | `ConsoleTracer`, `JsonlTracer` |
 
-The core imports no third-party package. The Anthropic SDK is imported only inside `AnthropicProvider`.
+The core imports no third-party package. The Anthropic, OpenAI and MCP SDKs are imported only inside `AnthropicProvider`, `OpenAIProvider` and `MCPTools`.
 
 **3. Failures the model can fix go to the model; everything else is explicit.** A bad argument, an unknown tool, a tool exception, a timeout, a denied approval: each becomes an error result in the conversation, because the model can often recover. Conditions the caller must handle (limits, refusals, truncation) are a `RunStatus`. Only infrastructure failures and programming errors raise.
 
@@ -41,12 +41,15 @@ src/agentloom/
 ├── context.py      ContextStrategy, KeepAll, SlidingWindow, Summarizing
 ├── events.py       Event dataclasses
 ├── hooks.py        Hooks base class
+├── output.py       OutputSpec: the final_answer tool behind output_type
 ├── agent.py        Agent, RunResult, RunStatus, Approval: the loop
 ├── tracing.py      ConsoleTracer, JsonlTracer
 ├── testing.py      ScriptedProvider, call
+├── mcp.py          MCPTools: an MCP server's tools as agentloom tools
 └── providers/
     ├── base.py       Provider, TextChunk, ThinkingChunk, Completed
-    └── anthropic.py  AnthropicProvider
+    ├── anthropic.py  AnthropicProvider
+    └── openai.py     OpenAIProvider (any OpenAI-compatible API)
 ```
 
 Dependencies point one way: `agent.py` depends on everything else; nothing depends on `agent.py` except `events.py`, for one type annotation.
@@ -83,6 +86,7 @@ agent.run(input, session, deps)
    │     context overflow ────────────────► status CONTEXT_OVERFLOW
    │     pause ───────────────────────────► next iteration (send the history again)
    │     no tool calls ───────────────────► status COMPLETED (or TRUNCATED)
+   │        (with output_type: remind the model to call final_answer; next iteration)
    ├─ for each tool call (in parallel when every tool allows it):
    │     unknown tool?            ─► error result
    │     repeated too often?      ─► error result
@@ -91,7 +95,8 @@ agent.run(input, session, deps)
    │     hooks.before_tool        ─► ToolDenied ─► error result
    │     run handler with timeout ─► result, or error result
    │     hooks.after_tool
-   └─ append ONE user message holding all results; save
+   ├─ append ONE user message holding all results; save
+   └─ with output_type: a valid final_answer call, made on its own ─► status COMPLETED
 ```
 
 Two details matter for correctness:
@@ -198,7 +203,7 @@ Checklist:
 3. **Tool results.** Some APIs want each result as its own message with a `tool` role. Expand `ToolResult` blocks accordingly in `_encode`; the framework always hands you all results of a step in one user message.
 4. **`provider_data`.** If the API returns anything that must be sent back verbatim, store it in `Message.provider_data` (JSON-serialisable) and set `provider=self.name`. When `request.history_edited` is true, leave out anything that is only valid for an unedited history.
 5. **Retries.** Turn off the SDK's own retries, or you will retry twice.
-6. **Test it** the way `tests/test_anthropic_provider.py` does: run the real SDK against a fake HTTP transport and assert on the request body and the decoded response.
+6. **Test it** the way `tests/test_anthropic_provider.py` and `tests/test_openai_provider.py` do: run the real SDK against a fake HTTP transport and assert on the request body and the decoded response.
 
 ---
 
@@ -279,15 +284,24 @@ Rules a strategy must follow:
 
 ---
 
+## Verification status
+
+What has and has not been verified, as of version 0.1.0.
+
+- **Verified:** 115 tests pass, covering the loop, tools, structured output, sessions, context strategies, tracing, both provider adapters, the MCP client and the example templates. `mypy --strict` and `ruff` are clean. The adapter tests run the real Anthropic SDK (1.13) and OpenAI SDK (3.29) against a local fake HTTP server, so request construction and stream parsing are exercised end to end. The MCP tests run the real MCP SDK (2.3) against a real server, in-process and as a subprocess over stdio.
+- **Not verified:** No test has called a live model API. Behaviour that only the real service can confirm should be checked with a real key before you rely on it: acceptance of the `fallbacks` beta parameter on your Claude account, prompt-cache hit rates, reasoning-block replay rules, how closely a given "OpenAI-compatible" service follows the protocol, and how reliably a given model uses the `final_answer` tool. MCP over Streamable HTTP is passed straight to the SDK and has not been exercised against a remote server.
+
+---
+
 ## What is not here
 
 Left out on purpose, to keep the core small and correct. Each can be built on the existing seams.
 
 | Not included | How to add it |
 |---|---|
-| Providers for other model APIs | A `Provider` subclass, about 60 lines; see above |
-| Structured final output (a typed, schema-validated answer) | A provider option for the API's structured-output feature, or a final "submit_answer" tool whose arguments are the answer |
-| MCP client | A function that lists an MCP server's tools and wraps each one as a `Tool` whose handler forwards the call |
+| Providers for APIs that are neither Claude nor OpenAI-compatible | A `Provider` subclass, about 60 lines; see above |
+| Constrained decoding for structured output | `output_type` validates the answer after the fact and asks again if it is wrong. To have the API guarantee the schema, add a provider option for its structured-output feature |
+| MCP resources, prompts, sampling and elicitation | `MCPTools` covers tools only. The rest of the protocol is available on the `mcp.Client` you can create yourself |
 | Built-in tools (files, shell, web) | Ordinary `@tool` functions. They are omitted because safe versions depend on your sandbox and permissions |
 | Durable execution across processes for long approvals | Sessions plus `agent.run(session=...)` to resume cover crash recovery; a workflow engine is the right tool for multi-day orchestration |
 | Images and files in messages | A new block type in `types.py` plus provider encoding |

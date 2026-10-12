@@ -2,24 +2,24 @@
 
 [English](../en/architecture.md)
 
-目录：[设计原则](#设计原则) · [模块结构](#模块结构) · [一次运行的全过程](#一次运行的全过程) · [可靠性保证](#可靠性保证) · [编写 Provider](#编写-provider) · [编写会话存储](#编写会话存储) · [编写上下文策略](#编写上下文策略) · [未包含的功能](#未包含的功能)
+目录：[设计原则](#设计原则) · [模块结构](#模块结构) · [一次运行的全过程](#一次运行的全过程) · [可靠性保证](#可靠性保证) · [编写 Provider](#编写-provider) · [编写会话存储](#编写会话存储) · [编写上下文策略](#编写上下文策略) · [验证状态](#验证状态) · [未包含的功能](#未包含的功能)
 
 ---
 
 ## 设计原则
 
-**1. 只有一个循环，而且看得见。** Agent 循环就是 `Agent._iterate` 这一个函数，约 120 行。没有图引擎，没有规划器抽象，也没有隐藏的提示词：模型收到的文字只有你写的 instructions、你的工具描述，以及对话本身。
+**1. 只有一个循环，而且看得见。** Agent 循环就是 `Agent._iterate` 这一个函数，约 160 行。没有图引擎，没有规划器抽象，也没有隐藏的提示词：模型收到的文字只有你写的 instructions、你的工具描述，以及对话本身。唯一的例外需要你主动开启：使用 `output_type` 时，Agent 会加入 `final_answer` 工具；如果模型用纯文本作答，还会追加一句提醒它使用该工具的话。
 
 **2. 四个扩展点，每个都是很小的接口。** 不同部署之间会变化的东西，都放在四个接口之一的后面，每个接口只有一两个方法：
 
 | 扩展点 | 接口 | 方法 | 内置实现 |
 |---|---|---|---|
-| 模型 API | `Provider` | `stream` | `AnthropicProvider`、`ScriptedProvider` |
+| 模型 API | `Provider` | `stream` | `AnthropicProvider`、`OpenAIProvider`、`ScriptedProvider` |
 | 持久化 | `Session` | `load`、`save` | `InMemorySession`、`FileSession` |
 | 上下文选择 | `ContextStrategy` | `prepare` | `KeepAll`、`SlidingWindow`、`Summarizing` |
 | 策略与观察 | `Hooks` | `on_event`、`before_model`、`before_tool`、`after_tool` | `ConsoleTracer`、`JsonlTracer` |
 
-核心不导入任何第三方包。Anthropic SDK 只在 `AnthropicProvider` 内部导入。
+核心不导入任何第三方包。Anthropic、OpenAI 和 MCP 的 SDK 只在 `AnthropicProvider`、`OpenAIProvider` 和 `MCPTools` 内部导入。
 
 **3. 模型能自己纠正的失败交给模型，其余的明确告诉调用方。** 参数错误、工具不存在、工具抛异常、超时、审批被拒，都会变成对话里的一条错误结果，因为模型往往能自行恢复。需要调用方处理的情况（达到上限、拒答、截断）以 `RunStatus` 表示。只有基础设施故障和编程错误才会抛异常。
 
@@ -41,12 +41,15 @@ src/agentloom/
 ├── context.py      ContextStrategy、KeepAll、SlidingWindow、Summarizing
 ├── events.py       各事件的 dataclass
 ├── hooks.py        Hooks 基类
+├── output.py       OutputSpec：output_type 背后的 final_answer 工具
 ├── agent.py        Agent、RunResult、RunStatus、Approval：循环本体
 ├── tracing.py      ConsoleTracer、JsonlTracer
 ├── testing.py      ScriptedProvider、call
+├── mcp.py          MCPTools：把 MCP 服务器的工具变成 agentloom 工具
 └── providers/
     ├── base.py       Provider、TextChunk、ThinkingChunk、Completed
-    └── anthropic.py  AnthropicProvider
+    ├── anthropic.py  AnthropicProvider
+    └── openai.py     OpenAIProvider（任何兼容 OpenAI 的 API）
 ```
 
 依赖方向是单向的：`agent.py` 依赖其余所有模块；除了 `events.py` 为了一处类型注解之外，没有模块依赖 `agent.py`。
@@ -83,6 +86,7 @@ agent.run(input, session, deps)
    │     上下文溢出 ──────────────────────► 状态 CONTEXT_OVERFLOW
    │     暂停 ────────────────────────────► 进入下一轮（把历史原样再发一次）
    │     没有工具调用 ────────────────────► 状态 COMPLETED（或 TRUNCATED）
+   │        （使用 output_type 时：提醒模型调用 final_answer，进入下一轮）
    ├─ 对每个工具调用（所有相关工具都允许时并行执行）：
    │     工具不存在？          ─► 错误结果
    │     重复次数过多？        ─► 错误结果
@@ -91,7 +95,8 @@ agent.run(input, session, deps)
    │     hooks.before_tool     ─► ToolDenied ─► 错误结果
    │     带超时执行处理函数    ─► 结果，或错误结果
    │     hooks.after_tool
-   └─ 追加【一条】包含全部结果的用户消息；保存
+   ├─ 追加【一条】包含全部结果的用户消息；保存
+   └─ 使用 output_type 时：单独发起且合法的 final_answer 调用 ─► 状态 COMPLETED
 ```
 
 有两处细节关系到正确性：
@@ -198,7 +203,7 @@ class AcmeProvider(Provider):
 3. **工具结果。** 有些 API 要求每个结果单独成一条 `tool` 角色的消息，请在 `_encode` 里把 `ToolResult` 块相应展开。框架交给你的总是"一步的所有结果在同一条用户消息里"。
 4. **`provider_data`。** 如果 API 返回了必须原样回传的内容，请存入 `Message.provider_data`（需可序列化为 JSON），并设置 `provider=self.name`。当 `request.history_edited` 为真时，要去掉那些只在历史未被改动时才有效的内容。
 5. **重试。** 关闭 SDK 自带的重试，否则会重试两遍。
-6. **测试。** 参照 `tests/test_anthropic_provider.py` 的做法：让真实 SDK 对接伪造的 HTTP 传输层，对请求体和解码后的响应做断言。
+6. **测试。** 参照 `tests/test_anthropic_provider.py` 和 `tests/test_openai_provider.py` 的做法：让真实 SDK 对接伪造的 HTTP 传输层，对请求体和解码后的响应做断言。
 
 ---
 
@@ -279,15 +284,24 @@ class ElideOldToolOutput(ContextStrategy):
 
 ---
 
+## 验证状态
+
+截至 0.1.0 版本，哪些已经验证、哪些还没有。
+
+- **已验证：** 115 个测试全部通过，覆盖 Agent 循环、工具、结构化输出、会话、上下文策略、追踪、两个 Provider 适配器、MCP 客户端和示例模板；`mypy --strict` 与 `ruff` 均无告警。适配器的测试使用真实的 Anthropic SDK（1.13）和 OpenAI SDK（3.29）对接本地伪造的 HTTP 服务，因此请求构造和流式解析都走了完整链路。MCP 的测试使用真实的 MCP SDK（2.3）对接真实的服务器，包括进程内连接和通过 stdio 连接子进程两种方式。
+- **未验证：** 没有任何测试调用过真实的模型 API。只有真实服务才能确认的行为，在依赖它之前请用真实 Key 自行验证：你的 Claude 账号是否接受 `fallbacks` 这个 beta 参数、提示缓存的实际命中率、推理块回传规则、某个“兼容 OpenAI”的服务对协议的实际遵循程度，以及具体某个模型使用 `final_answer` 工具的可靠程度。通过 Streamable HTTP 连接 MCP 是直接交给 SDK 处理的，没有针对远程服务器测试过。
+
+---
+
 ## 未包含的功能
 
 以下功能是有意不做的，目的是让核心保持小而正确。它们都可以基于现有的扩展点实现。
 
 | 未包含 | 如何添加 |
 |---|---|
-| 其他模型 API 的 Provider | 写一个 `Provider` 子类，约 60 行，见上文 |
-| 结构化最终输出（带类型、经 Schema 校验的答案） | 在 Provider 上增加选项，使用 API 的结构化输出功能；或者加一个 "submit_answer" 工具，以其参数作为答案 |
-| MCP 客户端 | 写一个函数列出 MCP 服务器的工具，把每个工具包装成 `Tool`，处理函数负责转发调用 |
+| 既非 Claude 也不兼容 OpenAI 的模型 API | 写一个 `Provider` 子类，约 60 行，见上文 |
+| 结构化输出的约束解码 | `output_type` 是事后校验，答案不对就让模型重答。如果想让 API 本身保证符合 Schema，可以在 Provider 上增加选项来使用它的结构化输出功能 |
+| MCP 的 resources、prompts、sampling 和 elicitation | `MCPTools` 只覆盖工具。协议的其余部分可以通过你自己创建的 `mcp.Client` 使用 |
 | 内置工具（文件、Shell、网页） | 用普通的 `@tool` 函数实现。之所以不内置，是因为安全的实现取决于你的沙箱和权限设置 |
 | 跨进程的持久化执行（用于长时间审批） | 会话加上 `agent.run(session=...)` 续跑已经覆盖了崩溃恢复；跨越数天的编排应该交给工作流引擎 |
 | 消息中的图片和文件 | 在 `types.py` 增加新的内容块类型，并在 Provider 中实现编码 |

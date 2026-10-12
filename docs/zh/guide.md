@@ -2,7 +2,7 @@
 
 [English](../en/guide.md)
 
-目录：[第一个 Agent](#1-第一个-agent) · [工具](#2-工具) · [运行](#3-运行-agent) · [会话](#4-会话) · [上限与重试](#5-上限与重试) · [人工审批](#6-人工审批) · [钩子](#7-钩子) · [上下文策略](#8-上下文策略) · [多 Agent](#9-多-agent) · [追踪](#10-追踪) · [测试](#11-测试你的-agent) · [Claude Provider](#12-claude-provider) · [常见问题](#13-常见问题)
+目录：[第一个 Agent](#1-第一个-agent) · [工具](#2-工具) · [运行](#3-运行-agent) · [会话](#4-会话) · [上限与重试](#5-上限与重试) · [人工审批](#6-人工审批) · [钩子](#7-钩子) · [上下文策略](#8-上下文策略) · [多 Agent](#9-多-agent) · [追踪](#10-追踪) · [测试](#11-测试你的-agent) · [Claude Provider](#12-claude-provider) · [OpenAI 兼容 Provider](#13-openai-兼容-provider) · [结构化输出](#14-结构化输出) · [MCP 服务器](#15-mcp-服务器) · [常见问题](#16-常见问题)
 
 > 说明：示例代码中的指令（instructions）和工具文档字符串使用英文书写，你可以换成中文，框架对语言没有要求。
 
@@ -546,15 +546,144 @@ provider = AnthropicProvider(
 
 **查看实际请求。** `provider.build_params(request)` 返回将要发送的全部关键字参数，写测试和排查问题时很有用。
 
-接入其他厂商的模型，参见[编写 Provider](architecture.md#编写-provider)。
+接入兼容 OpenAI 接口的服务，见下一节。其他情况参见[编写 Provider](architecture.md#编写-provider)。
 
 ---
 
-## 13. 常见问题
+## 13. OpenAI 兼容 Provider
+
+`OpenAIProvider` 通过官方 OpenAI SDK 使用 Chat Completions 协议，因此既能接 OpenAI，也能接任何实现了同一套接口的模型服务或本地服务。安装：`pip install "agentloom[openai]"`。
+
+```python
+from agentloom.providers.openai import OpenAIProvider
+
+provider = OpenAIProvider(
+    "deepseek-chat",                      # 模型 ID，以服务端的命名为准（必填）
+    base_url="https://api.deepseek.com",  # None 表示读取 OPENAI_BASE_URL，否则为 OpenAI
+    api_key=None,                         # None 表示读取 OPENAI_API_KEY
+    max_tokens=None,                      # 每次调用的输出上限；None 表示用服务端默认值
+    max_tokens_param="max_tokens",        # 或 "max_completion_tokens"
+    include_usage=True,                   # 要求在流中返回 token 用量
+    replay_reasoning=False,               # 见下文
+    extra=None,                           # temperature、reasoning_effort、extra_body 等
+)
+```
+
+常见服务的地址如下。模型 ID 变化很快，请以各服务自己的文档为准：
+
+| 服务 | `base_url` | 模型示例 |
+|---|---|---|
+| OpenAI | （默认） | `gpt-5` |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` |
+| 通义千问（阿里云百炼） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| Moonshot（Kimi） | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| OpenRouter | `https://openrouter.ai/api/v1` | 见其模型列表 |
+| Ollama（本地） | `http://localhost:11434/v1` | `llama3.3` |
+| vLLM（本地） | `http://localhost:8000/v1` | 你部署的模型名 |
+
+不需要 Key 的本地服务也要传一个占位值，例如 `api_key="ollama"`。使用 Azure OpenAI 或需要自定义 HTTP 设置时，请自己创建 SDK 客户端并传入：`client=AsyncAzureOpenAI(..., max_retries=0)`。
+
+它替你处理了这些事：
+
+- **始终使用流式请求**，并把分片到达的工具调用拼装完整，同一轮里的多个调用也能正确处理。
+- **解析工具参数。** 协议里参数是 JSON 字符串。因输出上限被截断的参数会以 `MAX_TOKENS` 上报且不会执行；其他原因导致的参数损坏会让这一轮被重试。
+- **在文本里标明工具错误**（`Error: ...`），因为协议的工具结果没有错误标志位。
+- **单独统计命中缓存的输入 token。** 服务端返回 `prompt_tokens_details.cached_tokens` 时，`result.usage.cache_read_tokens` 的含义与 Claude 一致。
+- **输出推理过程。** 服务端在流中返回 `reasoning_content` 或 `reasoning` 字段时，会转成 `ThinkingDelta` 事件。
+
+各家服务之间的差异：
+
+- **模型必须支持工具调用。** 否则服务端会报错，或者模型只用纯文本回答而不调用任何工具。
+- **`max_tokens_param`。** 大多数兼容服务使用 `max_tokens`。OpenAI 的推理模型不接受它，需要设置 `max_tokens_param="max_completion_tokens"`。
+- **`include_usage`。** 服务端不接受 `stream_options` 时请关闭。服务端不上报用量时，token 预算（`max_total_tokens`）无法生效。
+- **`replay_reasoning`。** 推理文本保存在 `provider_data` 里，默认不回传。只有当你的服务要求在后续轮次带上之前的 `reasoning_content` 时，才设置 `replay_reasoning=True`。
+- **流在没有结束原因的情况下中断**会被当作可重试的失败，因为无法区分被截断的回答和完整的回答。
+
+用一个 Provider 写下的会话可以换另一个 Provider 继续：每个 Provider 对自己产生的消息按原生格式回放，对其他 Provider 的消息则读取中立视图。
+
+---
+
+## 14. 结构化输出
+
+传入 `output_type`，得到的就是校验过的对象而不是一段文字：
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class Triage:
+    category: Literal["billing", "bug", "other"]
+    urgent: bool
+    summary: str
+
+agent = Agent(provider, instructions="Triage support tickets.", output_type=Triage)
+result = await agent.run("I was charged twice and need this fixed today!")
+
+result.data     # Triage(category="billing", urgent=True, summary="...")
+result.output   # 同一个答案的 JSON 文本
+```
+
+`output_type` 可以是数据类、pydantic 模型、任何可以用作工具参数的类型（`list[str]`、`int`、`Enum` 等），或者一个 JSON Schema 字典。数据类、pydantic 模型和枚举会被转换成对应的对象，嵌套在数据类或列表里的数据类也一样；传入 JSON Schema 时得到的是普通的字典和列表。
+
+原理：Agent 会额外提供给模型一个名为 `final_answer` 的工具，它的输入 Schema 就是你的类型，答案就是这个工具的参数。因此只要 Provider 支持工具调用就能用，答案走的也是和工具参数相同的校验逻辑。
+
+- **不合法的答案会被退回**给模型，并附上具体哪里不对，由它重新作答。尝试次数受 `max_steps` 限制。
+- **纯文本回复不会结束运行。** Agent 会追加一条用户消息 ``Give your final answer by calling the `final_answer` tool.`` 然后继续。框架添加的文字只有这条消息和该工具的描述，都在 `agentloom/output.py` 里。
+- **和其他工具调用同时给出的答案会被推迟。** 其他工具照常执行，答案被拒绝，模型看到工具结果后再重新作答。
+- **因输出上限被截断的答案不会被接受**，与其他被截断的工具调用一样。
+- 运行没有正常完成（`result.ok` 为假）时，`result.data` 为 `None`。
+
+使用 `output_type` 时，你自己的工具不能再叫 `final_answer`。
+
+---
+
+## 15. MCP 服务器
+
+`MCPTools` 连接一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务器，把它的工具变成 agentloom 的工具。安装：`pip install "agentloom[mcp]"`（需要官方 MCP SDK 2.0 或更高版本）。
+
+```python
+from agentloom.mcp import MCPTools
+
+async with MCPTools.stdio("npx", "-y", "@modelcontextprotocol/server-filesystem", ".") as files:
+    agent = Agent(provider, tools=files)
+    result = await agent.run("Which Python files here are longer than 300 lines?")
+```
+
+连接只在 `async with` 代码块内有效，请在块内运行 Agent。`MCPTools.stdio(command, *args, env=None, cwd=None)` 以子进程方式启动本地服务器。远程服务器直接传入它的 Streamable HTTP 地址：`MCPTools("https://example.com/mcp")`。`mcp.Client` 能接受的其他对象也可以传入，例如你自己配置了认证的传输层。
+
+多个服务器和你自己的工具可以随意组合：
+
+```python
+async with MCPTools.stdio("my-git-server", prefix="git") as git, MCPTools(url, prefix="crm") as crm:
+    agent = Agent(provider, tools=[*git, *crm, my_own_tool])
+```
+
+| 选项 | 作用 |
+|---|---|
+| `prefix="git"` | 工具名变为 `git_<name>`。两个服务器有同名工具时使用 |
+| `include=[...]` | 只暴露列出的工具。工具越少，提示词越短，模型选错的机会也越少 |
+| `requires_approval=True` 或 `[...]` | 让全部调用，或列出的那些工具的调用，先经过你的审批函数 |
+| `timeout=30` | 单次调用允许的秒数；默认使用 `RunLimits.tool_timeout` |
+
+MCP 工具就是普通工具，本指南的所有内容对它们同样适用：调用发出之前会先按服务器给出的 Schema 校验参数，失败会变成模型能读到的错误结果，上限、钩子和追踪也照常生效。工具名会被处理成模型 API 接受的形式（`files.delete` 变为 `files_delete`）。
+
+**请把 MCP 服务器当作不是你写的代码来对待。** 它的工具描述会进入模型的提示词，它的返回结果会进入对话。只使用你信任的服务器，用 `include` 只暴露需要的工具，并对有副作用的工具设置 `requires_approval`。
+
+暂不支持：MCP 的 resources、prompts、sampling 和 elicitation。工具结果里的图片等非文本内容会被替换成占位文字，例如 `[image omitted: image/png]`。
+
+---
+
+## 16. 常见问题
 
 | 现象 | 可能的原因与解决办法 |
 |---|---|
 | `ConfigurationError: AnthropicProvider needs the Anthropic SDK` | 执行 `pip install "agentloom[anthropic]"` |
+| `ConfigurationError: OpenAIProvider needs the OpenAI SDK` | 执行 `pip install "agentloom[openai]"` |
+| `ConfigurationError: MCPTools needs the MCP SDK`（或提示需要 2.0 以上版本） | 执行 `pip install "agentloom[mcp]"`，它要求 `mcp>=2.0` |
+| 使用 `output_type` 的运行以 `MAX_STEPS` 结束，`data` 为 `None` | 模型一直用文字回答，或者一直给出不合法的答案。查看追踪记录；通常简化 Schema 或补充字段说明就能解决 |
+| MCP 工具的结果提示与 MCP 服务器的连接已关闭 | Agent 是在 `async with MCPTools(...)` 代码块结束之后运行的。请在块内运行 |
+| OpenAI 兼容服务返回 `ProviderError: 400`，信息中提到 `stream_options`、`max_tokens` 或 `tools` | 该服务不接受这个字段：设置 `include_usage=False`、修改 `max_tokens_param`，或换一个支持工具调用的模型 |
 | 创建 Provider 时 `ssl.create_default_context` 抛出 `FileNotFoundError` | 环境变量 `SSL_CERT_FILE` 指向了不存在的文件。取消该变量，或让它指向真实存在的 CA 证书文件 |
 | `ProviderError: 401` | 缺少 API Key 或 Key 不正确 |
 | `ProviderError: 400`，信息中提到 `fallbacks` 或未知的 beta | 你使用的端点不接受回退 beta：`AnthropicProvider(refusal_fallback=False)` |
